@@ -1,0 +1,605 @@
+<html>
+	<head>
+		<style>
+			body {
+				background-color: #000000;
+				color: #ffffff;
+				font-family: courier;
+			}
+			
+			.slidecontainer {
+				position: absolute;
+				top: 30px;
+				left: 30px;
+			}
+			
+			#slider {
+				z-index: 2;
+				background-color: #003355;
+			}
+			
+			#threecanvas {
+				position: absolute;
+				top: 0px;
+				left: 0px;
+			}
+			
+			#text {
+				position: absolute;
+				top: 20px;
+				left: 20px;
+			}
+			
+			.svg {
+				position: relative;
+				z-index: 1;
+			}
+
+			#equation {
+				position: absolute;
+				top: 550px;
+				left: 50px;
+				z-index: 2;
+			}
+			
+			#reset {
+				position: absolute;
+				top: 520px;
+				left: 50px;
+				z-index: 3;
+			}
+			
+		</style>
+	</head>
+	<body>
+		</script>
+		
+		<div id="slidecontainer">
+		</div>
+		
+		<script type="module">
+			import * as THREE from '../three/build/three.module.js';
+			import { OrbitControls } from '../three/examples/jsm/controls/OrbitControls.js';
+			
+			//var w = window.innerWidth;
+			//var h = window.innerHeight;
+			var w = 500;
+			var h = 500;
+			var scene = new THREE.Scene();
+			var camera = new THREE.PerspectiveCamera(75, w/h, 0.1, 1000);
+			var renderer = new THREE.WebGLRenderer();
+			
+			var text;
+			var slider;
+			
+			var controls = new OrbitControls(camera, renderer.domElement);
+			//controls.maxPolarAngle = Math.PI * 0.5;
+			controls.minDistance = 0.1;
+			controls.maxDistance = 5000;
+			
+			//surface parameters 
+			var width = 3;
+			var height = 3;
+			var cols = 10;
+			var rows = 10;
+			var subs = 1;
+			
+			var dimensions = new THREE.Vector2(width, height);
+			var offsets = new THREE.Vector2(-1.5, -1.5); //relative to width, height
+			
+			var length = 1;
+			var polynomialWeights;
+			var needsUpdating = false;
+			
+			//materials
+			var material;
+			var pointsMaterial;
+			
+			//for storing geometry in buffer
+			var vertexCount;
+			var vertexBuffer;
+			var transformedVertexBuffer;
+			var indices;
+			var geometry;
+			var surface;
+			var pointsGeometry;
+			var points;
+			
+			var transitioning = false;
+			//need a function to interpolate values and then animate in-between frames
+			
+			var svg;
+			
+			function addAttributes(domElement, attributes){
+				for(var key in attributes) {
+					domElement.setAttribute(key, attributes[key]);
+				}
+			}
+			
+			function indexOf(i, j, rows, subs){
+				return (i*(rows*subs + 1)) + j;
+			}
+			
+			function round(value, decimals) {
+				return Number(Math.round(value+'e'+decimals)+'e-'+decimals);
+			}
+			
+			//put grid vertices in buffer, then perform transformation on buffer,
+			//placing transformed points into a new buffer
+			//pass dimensions into transformation function
+			
+			//Edge-indices array stays the same anyway
+			
+			function generateGridVertexArray(gridDimensions, offset, cols, rows, subs){
+				var vertices = [];
+				var deltaX = gridDimensions.x / (cols*subs);
+				var deltaY = gridDimensions.y / (rows*subs);
+
+				for(var i = 0; i <= cols*subs; i++){
+					for(var j = 0; j <= rows*subs; j++){
+						var x = offset.x + i*deltaX;
+						var y = offset.y + j*deltaY;
+						vertices.push(new THREE.Vector3(x, y, 0));
+					}
+				}
+				
+				return vertices;
+			}
+			
+			function transformVertexArray(vertices, transform){
+				var output = [];
+				for(var i = 0; i < vertices.length; i++){
+					output.push(transform(vertices[i]));
+				}
+				return output;
+			}
+			
+			function verticesToBuffer(vertices){
+				var buffer = new Float32Array(vertices.length * 3);
+				for(var i = 0; i < vertices.length; i++){
+					buffer[i * 3] = vertices[i].x;
+					buffer[(i * 3) + 1] = vertices[i].y;
+					buffer[(i * 3) + 2] =  vertices[i].z;
+				}
+				
+				//console.log("Buffer size: " + buffer.length);
+				return buffer;
+			}
+			
+			function cylinderFunction(r, length){
+				return function (u, v, w){
+					//var theta = 2 * Math.PI * vertex.y;
+					var x = r * Math.sin(v);
+					var y = r * Math.cos(v);
+					var z = length * (u - 0.5);
+					
+					return new THREE.Vector3(x, y, z);
+				}
+			}
+			/////
+			
+			function sumOverWeightMatrix(weightMatrix, u, v){
+				var sum  = 0;
+				for(var i = 0; i < weightMatrix.length; i++){
+					for(var j = 0; j < weightMatrix[i].length; j++){
+						sum += weightMatrix[i][j]*Math.pow(u, i)*Math.pow(v, j);
+					}
+				}
+				return sum;
+			}
+			
+			//weights as a 3x3x3 matrix
+			function polynomialFunction(weights){
+				return function (u, v, w){
+					//surface: only u and v used
+					var x = sumOverWeightMatrix(weights[0], u, v);
+					var y = sumOverWeightMatrix(weights[1], u, v);
+					var z = sumOverWeightMatrix(weights[2], u, v);
+					return new THREE.Vector3(x, y, z);
+				}
+			}
+			
+			function planeFunction(){
+				return function (vertex){
+					return new THREE.Vector3(vertex.x, vertex.y, vertex.z);
+				}
+			}
+			
+			function transformVertexBuffer(vertexBuffer, vertexCount, transform){
+				var outputBuffer = new Float32Array(vertexBuffer.length);
+				for(var i = 0; i < vertexCount; i++){
+					var transformedVertex = transform(
+						vertexBuffer[i * 3],
+						vertexBuffer[(i * 3) + 1],
+						vertexBuffer[(i * 3) + 2]
+					);
+					outputBuffer[i * 3] = transformedVertex.x;
+					outputBuffer[(i * 3) + 1] = transformedVertex.y;
+					outputBuffer[(i * 3) + 2] = transformedVertex.z;
+				}
+				
+				return outputBuffer;
+			}
+			
+			function generateIndexList(vertexArray, cols, rows, subs){
+				var edges = [];
+				var iMax = cols*subs;
+				var jMax = rows*subs;
+				var p0, p1;
+				
+				for(var i = 0; i <= iMax; i++){
+					for(var j = 0; j <= jMax; j++){
+						p0 = indexOf(i, j, rows, subs);
+						if((i%subs == 0) && (j < jMax)){
+							p1 = indexOf(i, j + 1, rows, subs);
+							edges.push(p0);
+							edges.push(p1);
+						}
+						if((j%subs == 0) && (i < iMax)){
+							p1 = indexOf(i + 1, j, rows, subs);
+							edges.push(p0);
+							edges.push(p1);
+						}
+					}
+				}
+				
+				return edges;
+			}
+			
+			function addPoints(){
+				pointsGeometry = new THREE.BufferGeometry();
+				pointsGeometry.setAttribute('position', new THREE.Float32BufferAttribute(transformedVertexBuffer, 3));
+				pointsMaterial = new THREE.PointsMaterial({ color: 0x0088ff, size: 0.01 });
+				points = new THREE.Points(pointsGeometry, pointsMaterial);
+				
+				scene.add(points);
+			}
+			
+			function addSlider(){
+				slider = document.createElement("INPUT");
+				addAttributes(slider, {
+					"type": "range",
+					"id": "slider",
+					"min": "1",
+					"max": "1.2",
+					"value": "1",
+					"step": "0.01"
+				});
+				
+				slider.addEventListener("change", function () {
+					length = document.getElementById("slider").value;
+					update();
+				});
+				document.getElementById("slidecontainer").appendChild(slider);
+			}
+			
+			function UVContainer(UVText, superscript){
+				var output = document.createElement('span');
+				var uv = document.createElement('span');
+				var sup = document.createElement('sup');
+				uv.innerHTML = UVText;
+				sup.innerHTML = superscript;
+				output.appendChild(uv);
+				output.appendChild(sup);
+				
+				return output;
+			}
+			
+			function printPolynomial(){
+				var elementID = "";
+				
+				for(var c = 0; c < polynomialWeights.length; c++){
+					switch(c){
+						case 0:
+							elementID = "X";
+							break;
+						case 1:
+							elementID = "Y";
+							break;
+						case 2:
+							elementID = "Z";
+							break;
+					}
+					document.getElementById(elementID).innerHTML = '';
+					for(var u = 0; u < polynomialWeights[c].length; u++){
+						for(var v = 0; v < polynomialWeights[c][u].length; v++){
+							var weight = polynomialWeights[c][u][v];
+							if(weight != 0){
+								var element = document.getElementById(elementID);
+								var weightContainer = document.createElement("span");
+								weightContainer.textContent = " + " + weight;
+								element.appendChild(weightContainer);
+								
+								if(u > 0) element.appendChild(UVContainer("u", u));
+								if(v > 0) element.appendChild(UVContainer("v", v));
+							}
+						}
+					}
+				}
+			}
+			
+			function resetWeights(){
+				polynomialWeights = [
+					[
+						[0, 1, 0],
+						[0, 0, 0],
+						[0, 0, 0]
+					],
+					[
+						[0, 0, 0],
+						[1, 0, 0],
+						[0, 0, 0]
+					],
+					[
+						[0, 0, 0],
+						[0, 0, 0],
+						[0, 0, 0]
+					]
+				];
+			}
+			
+			function init(){
+				renderer.setSize(w, h);
+				document.getElementById("slidecontainer").appendChild(renderer.domElement);
+				renderer.domElement.setAttribute("id", "threecanvas");
+			
+				//create materials
+				material = new THREE.LineBasicMaterial({color: 0xff0055});
+				
+				resetWeights();
+				setCubeValuesToWeights();
+			
+				var vertices = generateGridVertexArray(dimensions, offsets,	cols, rows,	subs);
+				vertexCount = vertices.length;
+				vertexBuffer = verticesToBuffer(vertices);
+				//console.log(vertexBuffer);
+				transformedVertexBuffer = transformVertexBuffer(vertexBuffer, vertexCount, polynomialFunction(polynomialWeights));
+				
+				indices = generateIndexList(vertices, cols, rows, subs);
+				
+				geometry = new THREE.BufferGeometry();
+				geometry.setAttribute('position', new THREE.Float32BufferAttribute(transformedVertexBuffer, 3));
+				geometry.setIndex(indices);
+				
+				surface = new THREE.LineSegments(geometry, material);
+				scene.add(surface);
+				
+				camera.position.z = 5;
+			}
+			
+			function update(){
+				surface.geometry.attributes.position.needsUpdate = true;
+				transformedVertexBuffer = transformVertexBuffer(vertexBuffer, vertexCount, polynomialFunction(polynomialWeights));
+				geometry.setAttribute('position', new THREE.Float32BufferAttribute(transformedVertexBuffer, 3));
+			}
+			
+			function animate(){
+				requestAnimationFrame(animate);
+				renderer.render(scene, camera);
+				//if(needsUpdating){
+				//	update();
+				//}
+			}
+			
+			//CONTROL CUBE
+			var root3 = Math.sqrt(3);
+			var root2 = Math.SQRT2;
+			var root6 = Math.sqrt(6);
+			const XY = 0;
+			const XZ = 1;
+			const YZ = 2;
+			const CYAN = [0, 1, 1];
+			const MAGENTA = [1, 0, 1];
+			const YELLOW = [1, 1, 0];
+			const CUBE_COLORS = [CYAN, MAGENTA, YELLOW];
+			const COORDINATES = ["x", "y", "z"];
+
+			var isoProjectionMatrix = new THREE.Matrix3();
+			isoProjectionMatrix.set(
+				root3, 0, -root3,
+				1, 2, 1,
+				root2, -root2, root2
+			);
+			isoProjectionMatrix.multiplyScalar(root6);
+
+			//generate vertices of square in plane determined by 'orientation'
+			function generateSquareVertices(orientation, side, xOffset, yOffset){
+				var output = [];
+				var indices = [[0, 0], [0, 1],  [1, 1], [1, 0]];
+				for(var i = 0; i < indices.length; i++){
+					var u = xOffset + indices[i][0]*side;
+					var v = yOffset + indices[i][1]*side;
+					switch(orientation){
+						case XY:
+							output.push(new THREE.Vector3(-u, v, 0));
+							break;
+						case XZ:
+							output.push(new THREE.Vector3(-u, 0, -v));
+							break;
+						case YZ:
+							output.push(new THREE.Vector3(0, u, -v));
+							break;
+					}
+					
+				}
+				return output;
+			}
+
+			function isoTransformVertex(vertex){
+				var transformedVertex = vertex.clone();
+				transformedVertex.applyMatrix3(isoProjectionMatrix);
+				return new THREE.Vector2(transformedVertex.x, transformedVertex.y);				
+			}
+
+			function isoTransformVertices(vertices){
+				var output = [];
+				for(var i = 0; i < vertices.length; i++){
+					output.push(isoTransformVertex(vertices[i]));
+				}
+				return output;
+			}
+
+			function generateStringFromVertices(vertices, xPosition, yPosition){
+				var output = "";
+				for(var i = 0; i < vertices.length; i++){
+					var x = (vertices[i].x + xPosition).toFixed(4);
+					var y = (vertices[i].y + yPosition).toFixed(4);
+					output += x + "," + y;
+					if(i < vertices.length - 1){
+						output += " ";
+					}
+				}
+				return output;
+			}
+			
+			function hexColorFromLightness(CMY, lightness){
+				var output = "#";
+				for(var i = 0; i < CMY.length; i++){
+					var channel = Math.round(CMY[i] * lightness * 255).toString(16);
+					if(channel.length == 1) channel = "0" + channel;
+					output += channel;
+				}
+				return output;
+			}
+			
+			//console.log(hexColorFromLightness(CYAN, 0.2));
+			//console.log(hexColorFromLightness(MAGENTA, 0.6));
+			//console.log(hexColorFromLightness(YELLOW, 1));
+			
+
+			function createIsobutton(orientation, side, xOffset, yOffset, xOffsetSVG, yOffsetSVG, coordinateIndex, uIndex, vIndex){
+				var isobutton = document.createElementNS("http://www.w3.org/2000/svg", "polygon");
+				var interval = 0.25;
+				
+				var vertices = isoTransformVertices(
+					generateSquareVertices(orientation, side, xOffset, yOffset)
+				);
+				
+				var vertexString = generateStringFromVertices(vertices, xOffsetSVG, yOffsetSVG);
+				
+				addAttributes(isobutton, {
+					"points": vertexString,
+					"fill": "#000000",
+					"stroke": "#ffffff",
+					"coordinate": COORDINATES[coordinateIndex],
+					"u_index": uIndex,  // for getting weights
+					"v_index": vIndex,  // for getting weights
+					"colorIndex": coordinateIndex,
+					"lightness": 0,
+					"class": "isobutton"
+				});
+				
+				isobutton.addEventListener("click", function(){
+					//console.log(orientation + " clicked at " + xOffset + ", " + yOffset);
+					//console.log("BUTTON " + event.button);
+					var lightness = parseFloat(isobutton.getAttribute("lightness"));
+					lightness += interval;
+					if(lightness > 1.0) lightness = 0.0;
+					isobutton.setAttribute("lightness", lightness);
+					isobutton.setAttribute("fill", hexColorFromLightness(CUBE_COLORS[coordinateIndex], lightness));
+					
+					setWeightsToCubeValues();
+					printPolynomial();
+					update();
+				});
+				
+				isobutton.addEventListener("mouseover", function(){
+					//console.log("moused");
+					isobutton.setAttribute("stroke", "#000000");
+				});
+				
+				isobutton.addEventListener("mouseleave", function(){
+					//console.log("moused");
+					isobutton.setAttribute("stroke", "#ffffff");
+				});
+				
+				return isobutton;
+			}
+
+			function addControlCube(side, uMax, vMax, xOffsetSVG, yOffsetSVG){
+				var svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+				//make svg area big enough to fit cube
+				
+				addAttributes(svg, {"width": 150, "height": 150, "class": "svg"});
+				
+				for(var i = 0; i < 3; i++){
+					for(var j = 0; j < uMax; j++){
+						for(var k = 0; k < vMax; k++){
+							var isobutton = createIsobutton(i, side, j*side, k*side,
+								xOffsetSVG, yOffsetSVG, i, j, k);
+							svg.appendChild(isobutton);
+						}
+					}
+				}
+				
+				document.body.appendChild(svg);
+			}
+			
+			function setWeightsToCubeValues() {
+				var isobuttons = Array.from(document.getElementsByClassName("isobutton"));
+				isobuttons.forEach(function (isobutton) {
+					var coordinate3D = isobutton.getAttribute("colorIndex");
+					var uIndex = isobutton.getAttribute("u_index");
+					var vIndex = isobutton.getAttribute("v_index");
+					var value = isobutton.getAttribute("lightness");
+					
+					polynomialWeights[coordinate3D][uIndex][vIndex] = value;
+					//console.log(`Index: (${uIndex}, ${vIndex}) Value: ${value}`);
+				});
+				
+				//document.getElementById("equation").textContent = printPolynomial();
+			}
+			
+			function setCubeValuesToWeights() {
+				var isobuttons = Array.from(document.getElementsByClassName("isobutton"));
+				isobuttons.forEach(function (isobutton) {
+					var coordinate3D = isobutton.getAttribute("colorIndex");
+					var uIndex = isobutton.getAttribute("u_index");
+					var vIndex = isobutton.getAttribute("v_index");
+					var lightness = polynomialWeights[coordinate3D][uIndex][vIndex];
+					isobutton.setAttribute("lightness", lightness);
+					isobutton.setAttribute("fill", hexColorFromLightness(CUBE_COLORS[coordinate3D], lightness));
+					//console.log(`Index: (${uIndex}, ${vIndex}) Value: ${value}`);
+				});
+				
+				//document.getElementById("equation").textContent = printPolynomial();
+			}
+			
+			function addResetButton(){
+				var resetButton = document.createElement("button");
+				resetButton.setAttribute("id", "reset");
+				resetButton.innerHTML = "Reset";
+				resetButton.addEventListener("click", function(){
+					resetWeights();
+					setCubeValuesToWeights();
+					update();
+					printPolynomial();
+				});
+				document.body.appendChild(resetButton);
+			}
+			
+			addControlCube(5, 3, 3, 75, 75);
+			
+
+			
+			//console.log(document.querySelectorAll(".isobutton"));
+						
+			init();
+			addPoints();
+			addSlider();
+			addResetButton();
+			//addText();
+			animate();
+			
+					
+		</script>
+		
+		<div id="equation">
+			X = <span id="X"> </span>
+			<br>
+			Y = <span id="Y"> </span>
+			<br>
+			Z = <span id="Z"> </span>
+		</div>
+	</body>
+<html>
