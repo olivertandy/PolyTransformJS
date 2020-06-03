@@ -1,3 +1,3 @@
 # PolyTransformJS
 Version 2 of Polynomial Transform, implemented in three.js
-![Example](/images/example.png)
+![Example](/Images/example.png)
